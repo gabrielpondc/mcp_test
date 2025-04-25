@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "amap-amap-sse": {
+      "url": "http://127.0.0.1:8080/sse",
+      "description": "本地天气查询服务"
+    }
+  }
+}
