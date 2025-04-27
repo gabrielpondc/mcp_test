@@ -2,7 +2,7 @@ import json
 import asyncio
 import re
 import sys
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from contextlib import AsyncExitStack
 
 from mcp import ClientSession
@@ -40,6 +40,7 @@ class Client:
         )
         self.model = "melhornes/gemma3-27b-tools:latest"
         self.messages = []
+        self.workflow_messages = []  # 用于工作流规划的消息历史
 
     async def connect_server(self, server_url):
         async with self._lock:  # 防止并发调用 connect
@@ -148,31 +149,251 @@ class Client:
         except json.JSONDecodeError:
             return llm_response
 
+    async def plan_workflow(self, user_query: str) -> List[Dict[str, Any]]:
+        """规划工具调用的工作流
+        
+        Args:
+            user_query: 用户的问题
+            
+        Returns:
+            计划的工作流步骤列表，每个步骤是一个工具调用
+        """
+        # 创建规划工作流的系统提示
+        tools_description = "\n".join([format_tools_for_llm(tool) for tool in self.tools.values()])
+        planning_prompt = (
+            "你是一个工作流规划助手。你需要根据用户的问题规划一系列工具调用来解决问题。\n\n"
+            f"可用工具:\n{tools_description}\n\n"
+            "请分析用户问题，确定需要调用哪些工具以及调用顺序。"
+            "如果问题可以直接回答而不需要工具，请返回空列表。"
+            "返回JSON格式的工作流计划，格式如下:\n"
+            "[\n"
+            "  {\n"
+            '    "tool": "工具名称",\n'
+            '    "arguments": {\n'
+            '      "参数名": "参数值"\n'
+            "    },\n"
+            '    "reason": "为什么需要调用这个工具"\n'
+            "  },\n"
+            "  ...\n"
+            "]\n"
+        )
+        
+        # 构建消息
+        workflow_messages = [
+            {"role": "system", "content": planning_prompt},
+            {"role": "user", "content": f"为以下问题规划工作流: {user_query}"}
+        ]
+        
+        # 调用LLM获取工作流计划
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=workflow_messages,
+            stream=False,
+        )
+        plan_response = response.choices[0].message.content
+        
+        try:
+            # 尝试从回复中提取JSON
+            pattern = r"```json\n(.*?)\n?```"
+            match = re.search(pattern, plan_response, re.DOTALL)
+            if match:
+                plan_response = match.group(1)
+            
+            workflow = json.loads(plan_response)
+            if not isinstance(workflow, list):
+                return []
+                
+            print(f"[工作流规划]: 计划执行 {len(workflow)} 个工具调用")
+            for i, step in enumerate(workflow):
+                print(f"  步骤 {i+1}: {step.get('tool')} - {step.get('reason', '无原因说明')}")
+                
+            return workflow
+        except (json.JSONDecodeError, AttributeError) as e:
+            print(f"[警告] 无法解析工作流计划: {e}")
+            return []
+
+    async def execute_workflow(self, workflow: List[Dict[str, Any]], user_query: str) -> str:
+        """按顺序执行工作流中的工具
+        
+        Args:
+            workflow: 工作流步骤列表
+            user_query: 原始用户问题
+            
+        Returns:
+            执行结果汇总
+        """
+        if not workflow:
+            return "无需执行工具，直接回答问题。"
+            
+        results = []
+        for i, step in enumerate(workflow):
+            tool_name = step.get("tool")
+            arguments = step.get("arguments", {})
+            
+            if tool_name not in self.tools:
+                results.append(f"[错误] 步骤 {i+1}: 找不到工具 '{tool_name}'")
+                continue
+                
+            try:
+                print(f"[执行] 步骤 {i+1}: 调用工具 {tool_name}")
+                result = await self.session.call_tool(tool_name, arguments)
+                result_str = f"步骤 {i+1} ({tool_name}) 结果: {result}"
+                print(f"[结果] {result_str}")
+                results.append(result_str)
+            except Exception as e:
+                error_msg = f"步骤 {i+1} ({tool_name}) 执行失败: {str(e)}"
+                print(f"[错误] {error_msg}")
+                results.append(error_msg)
+        
+        # 将所有结果组合成一个字符串
+        return "\n\n".join(results)
+
+    async def evaluate_tools_results(self, tools_results: str, user_query: str) -> Dict[str, Any]:
+        """评估工具执行结果是否足够回答用户问题
+        
+        Args:
+            tools_results: 工具执行的结果
+            user_query: 用户的原始问题
+            
+        Returns:
+            评估结果，包括是否满足要求和可能需要的额外工具
+        """
+        eval_prompt = (
+            "你是一个工具结果评估专家。请评估提供的工具执行结果是否足够回答用户的问题。"
+            "只根据用户的原始问题进行判断，不推测用户可能的隐含意图或扩展需求。"
+            "如果不足够，请指出还需要使用哪些工具来获取缺少的信息。\n\n"
+            f"可用工具:\n{', '.join(self.tools.keys())}\n\n"
+            "请返回JSON格式的评估结果，格式如下:\n"
+            "{\n"
+            '  "results_sufficient": true/false,\n'
+            '  "missing_information": "描述缺少的信息",\n'
+            '  "suggested_tools": [\n'
+            '    {\n'
+            '      "tool": "工具名称",\n'
+            '      "arguments": {"参数名": "参数值"},\n'
+            '      "reason": "为什么需要调用这个工具"\n'
+            '    }\n'
+            "  ]\n"
+            "}\n"
+        )
+        
+        eval_messages = [
+            {"role": "system", "content": eval_prompt},
+            {"role": "user", "content": f"用户问题: {user_query}\n\n工具执行结果: {tools_results}"}
+        ]
+        
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=eval_messages,
+            stream=False,
+        )
+        eval_response = response.choices[0].message.content
+        
+        try:
+            pattern = r"```json\n(.*?)\n?```"
+            match = re.search(pattern, eval_response, re.DOTALL)
+            if match:
+                eval_response = match.group(1)
+                
+            evaluation = json.loads(eval_response)
+            print(f"[评估结果]: 工具结果{'' if evaluation.get('results_sufficient', True) else '不'}足够回答问题")
+            if not evaluation.get('results_sufficient', True):
+                print(f"[缺少信息]: {evaluation.get('missing_information', '未指定')}")
+            return evaluation
+        except (json.JSONDecodeError, AttributeError) as e:
+            print(f"[警告] 无法解析评估结果: {e}")
+            return {
+                "results_sufficient": True,
+                "missing_information": "无法确定",
+                "suggested_tools": []
+            }
+
+    async def generate_final_answer(self, user_query: str, workflow_results: str) -> str:
+        """基于工作流执行结果生成最终回答
+        
+        Args:
+            user_query: 用户的原始问题
+            workflow_results: 工作流执行的结果
+            
+        Returns:
+            最终回答
+        """
+        answer_prompt = (
+            "请基于执行的工具结果，为用户问题生成一个全面、准确的回答。"
+            "回答应该直接针对用户的问题，并综合所有工具执行的结果。"
+            "保持回答简洁但信息丰富，重点关注最相关的信息。"
+        )
+        
+        answer_messages = [
+            {"role": "system", "content": answer_prompt},
+            {"role": "user", "content": f"用户问题: {user_query}\n\n工具执行结果:\n{workflow_results}"}
+        ]
+        
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=answer_messages,
+            stream=False,
+        )
+        return response.choices[0].message.content
+
     async def chat_loop(self):
         """运行交互式聊天循环"""
         print("MCP 客户端启动")
         print("输入 /bye 退出")
 
         while True:
-            prompt = input(">>> ").strip()
-            if "/bye" in prompt.lower():
+            user_query = input(">>> ").strip()
+            if "/bye" in user_query.lower():
                 break
 
-            response = await self.chat(prompt)
-            self.messages.append({"role": "assistant", "content": response})
-            print(f"[LLM响应]: {response}")
-
-            result = await self.execute_tool(response)
-            while result != response:
-                response = await self.chat(result, "system")
-                self.messages.append(
-                    {"role": "assistant", "content": response}
-                )
-                print(f"[结果处理后的响应]: {response}")
-                result = await self.execute_tool(response)
+            # 记录用户问题到消息历史
+            self.messages.append({"role": "user", "content": user_query})
             
-            if result == response:
-                print(response)
+            # 1. 规划工作流
+            print("[系统] 正在规划工作流...")
+            workflow = await self.plan_workflow(user_query)
+            
+            # 2. 如果有工作流，按顺序执行工具
+            if workflow:
+                print("[系统] 开始执行工作流...")
+                workflow_results = await self.execute_workflow(workflow, user_query)
+            else:
+                workflow_results = "无需执行工具，直接回答问题。"
+                
+            # 3. 评估工具执行结果是否足够
+            max_iterations = 3  # 限制最大迭代次数，防止无限循环
+            current_results = workflow_results
+            iteration = 0
+            
+            while iteration < max_iterations:
+                iteration += 1
+                
+                # 评估工具结果
+                print(f"[系统] 评估工具执行结果 (迭代 {iteration}/{max_iterations})...")
+                evaluation = await self.evaluate_tools_results(current_results, user_query)
+                
+                # 如果结果足够或没有建议的工具，跳出循环
+                if evaluation.get("results_sufficient", True) or not evaluation.get("suggested_tools"):
+                    break
+                    
+                # 执行建议的额外工具
+                print(f"[系统] 工具结果不足，正在执行额外工具...")
+                additional_workflow = evaluation.get("suggested_tools", [])
+                
+                if additional_workflow:
+                    additional_results = await self.execute_workflow(additional_workflow, user_query)
+                    # 合并之前的结果
+                    current_results += f"\n\n迭代 {iteration} 额外工具执行结果:\n{additional_results}"
+                else:
+                    break
+            
+            # 4. 根据最终工具结果生成最终回答
+            print("[系统] 基于工具结果生成最终回答...")
+            final_answer = await self.generate_final_answer(user_query, current_results)
+            
+            # 5. 添加最终答案到消息历史并输出
+            self.messages.append({"role": "assistant", "content": final_answer})
+            print(f"\n[回答]:\n{final_answer}\n")
 
 
 async def main():

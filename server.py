@@ -24,6 +24,41 @@ async def query_weather(location: str=Body('',description='查询地址'), time:
     
     return {"content": f"{time}的{location}的天气是超级大暴雨，狂风黄色预警，气温25度。"}
 
+@mcp.tool(
+    name="根据温度建议穿衣服", 
+    description=f"可以根据温度建议穿衣服"
+)
+async def dress_advice(temperature: float=Body(25.0,description='温度')):
+    """
+    根据温度建议穿衣服
+    
+    Args:
+        temperature: 温度
+    
+    Returns:
+        穿衣建议
+    """
+    
+    if temperature < 10:
+        return {"content": "建议穿羽绒服，注意保暖。"}
+    elif temperature < 20:
+        return {"content": "建议穿外套，适合春秋季节。"}
+    else:
+        return {"content": "建议穿短袖，适合夏季。"}
+@mcp.tool(
+    name="查询时间", 
+    description=f"可以查询当前时间"
+)
+
+async def query_time():
+    """
+    查询当前时间
+    
+    Returns:
+        当前时间
+    """
+    
+    return {"content": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 # 简化运行方式
 if __name__ == "__main__":
     print(f"启动 MCP 服务器在 http://0.0.0.0:8000...", file=sys.stderr)
